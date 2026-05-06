@@ -1,0 +1,28 @@
+# Copy this to spinal-tap.toml or pass its path as the first CLI argument.
+listen = "127.0.0.1:8125"
+history_points = 120
+redraw_millis = 250
+
+[[metrics]]
+name = "requests"
+view = "chart"
+unit = "req"
+
+# Labelled DogStatsD series are grouped under the base metric name.
+# This entry matches all variants, for example:
+#   requests:1|c|#service:api,host:a
+#   requests:1|c|#service:worker,host:b
+[[metrics]]
+name = "labelled.requests"
+view = "chart"
+unit = "req"
+
+[[metrics]]
+name = "queue.depth"
+view = "numeric"
+unit = "jobs"
+
+[[metrics]]
+name = "request.duration"
+view = "chart"
+unit = "ms"
