@@ -54,12 +54,15 @@ Both lines match `name = "requests"`, but render as separate labelled rows/chart
 - PageUp/PageDown: page by the visible item count.
 - Home/End: jump to first/last item in the focused pane.
 - `/`: filter metrics by name or labels.
+- `a`: add a metric from discovered traffic or a typed base metric name.
 - `+`/`-`: increase/decrease chart height.
 - Enter: open the selected metric details pane.
 - Enter while searching: keep the current filter.
 - Esc while searching: stop editing and keep the current filter.
 - Ctrl-W while searching: clear the filter input.
 - `c` with an active filter: clear the current filter.
+- In the add pane, Up/Down selects a discovered metric, Left/Right toggles numeric/chart, Tab edits
+  units, Ctrl-W clears the active field, Enter adds, and Esc cancels.
 - Esc or Enter: close the details pane.
 - `q` or Ctrl-C: quit.
 
@@ -75,7 +78,7 @@ The current focus is fast, low-overhead live visibility for e.g. debugging or qu
 If you want more than this you probably want a real metrics collector, but I'm open to additions
 where they keep the lightweight focus. Some features I want to add include:
 
-- Dynamic addition of metrics (and saving of modified config)
+- Saving dynamically added metrics back to config
 - Searching for metrics
 - Adjust series ring buffer size
 - Reset / flush metric

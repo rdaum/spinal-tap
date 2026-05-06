@@ -11,7 +11,7 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -79,7 +79,9 @@ struct App {
     config: Config,
     rx: Receiver<Sample>,
     metrics: HashMap<String, MetricState>,
+    seen_metrics: HashMap<String, SeenMetric>,
     metric_config: HashMap<String, MetricConfig>,
+    track_all: bool,
     received: u64,
     started_at: Instant,
     focus: Focus,
@@ -93,6 +95,12 @@ struct App {
     details_open: bool,
     search_active: bool,
     search_query: String,
+    add_open: bool,
+    add_query: String,
+    add_selected: usize,
+    add_view: MetricView,
+    add_unit: String,
+    add_edit_unit: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -104,11 +112,14 @@ enum Focus {
 impl App {
     fn new(config: Config, rx: Receiver<Sample>) -> Self {
         let metric_config = config.metric_map();
+        let track_all = metric_config.is_empty();
         Self {
             config,
             rx,
             metrics: HashMap::new(),
+            seen_metrics: HashMap::new(),
             metric_config,
+            track_all,
             received: 0,
             started_at: Instant::now(),
             focus: Focus::Numeric,
@@ -122,12 +133,19 @@ impl App {
             details_open: false,
             search_active: false,
             search_query: String::new(),
+            add_open: false,
+            add_query: String::new(),
+            add_selected: 0,
+            add_view: MetricView::Numeric,
+            add_unit: String::new(),
+            add_edit_unit: false,
         }
     }
 
     fn drain_samples(&mut self) {
         while let Ok(sample) = self.rx.try_recv() {
             self.received += 1;
+            self.record_seen(&sample);
             if !self.should_track(&sample.name) {
                 continue;
             }
@@ -142,8 +160,15 @@ impl App {
         }
     }
 
+    fn record_seen(&mut self, sample: &Sample) {
+        self.seen_metrics
+            .entry(sample.name.clone())
+            .or_insert_with(|| SeenMetric::new(sample.name.clone()))
+            .push(sample);
+    }
+
     fn should_track(&self, name: &str) -> bool {
-        self.metric_config.is_empty() || self.metric_config.contains_key(name)
+        self.track_all || self.metric_config.contains_key(name)
     }
 
     fn configured_view(&self, name: &str) -> MetricView {
@@ -161,6 +186,10 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.add_open {
+            return self.handle_add_key(code, modifiers);
+        }
+
         if self.search_active {
             return self.handle_search_key(code, modifiers);
         }
@@ -182,6 +211,7 @@ impl App {
 
         match code {
             KeyCode::Enter => self.details_open = self.selected_metric().is_some(),
+            KeyCode::Char('a' | 'A') => self.open_add(),
             KeyCode::Char('/') => self.search_active = true,
             KeyCode::Char('c' | 'C') if !self.search_query.is_empty() => {
                 self.search_query.clear();
@@ -200,6 +230,116 @@ impl App {
         }
 
         false
+    }
+
+    fn handle_add_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+
+        match code {
+            KeyCode::Esc => self.add_open = false,
+            KeyCode::Enter => self.add_selected_metric(),
+            KeyCode::Tab => self.add_edit_unit = !self.add_edit_unit,
+            KeyCode::Left | KeyCode::Right => self.toggle_add_view(),
+            KeyCode::Down => self.move_add_selection(1),
+            KeyCode::Up => self.move_add_selection(-1),
+            KeyCode::Backspace if self.add_edit_unit => {
+                self.add_unit.pop();
+            }
+            KeyCode::Backspace => {
+                self.add_query.pop();
+                self.clamp_add_selection();
+            }
+            KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.add_edit_unit {
+                    self.add_unit.clear();
+                } else {
+                    self.add_query.clear();
+                    self.clamp_add_selection();
+                }
+            }
+            KeyCode::Char(ch) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                if self.add_edit_unit {
+                    self.add_unit.push(ch);
+                } else {
+                    self.add_query.push(ch);
+                    self.clamp_add_selection();
+                }
+            }
+            _ => {}
+        }
+
+        false
+    }
+
+    fn open_add(&mut self) {
+        self.add_open = true;
+        self.add_query.clear();
+        self.add_selected = 0;
+        self.add_view = MetricView::Numeric;
+        self.add_unit.clear();
+        self.add_edit_unit = false;
+    }
+
+    fn toggle_add_view(&mut self) {
+        self.add_view = match self.add_view {
+            MetricView::Chart => MetricView::Numeric,
+            MetricView::Numeric => MetricView::Chart,
+        };
+    }
+
+    fn move_add_selection(&mut self, delta: isize) {
+        let count = self.add_candidates().len();
+        if count == 0 {
+            self.add_selected = 0;
+            return;
+        }
+
+        if delta.is_negative() {
+            self.add_selected = self.add_selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.add_selected = self
+                .add_selected
+                .saturating_add(delta as usize)
+                .min(count - 1);
+        }
+    }
+
+    fn clamp_add_selection(&mut self) {
+        self.add_selected = self
+            .add_selected
+            .min(self.add_candidates().len().saturating_sub(1));
+    }
+
+    fn add_selected_metric(&mut self) {
+        let name = self
+            .add_candidates()
+            .get(self.add_selected)
+            .map(|metric| metric.name.clone())
+            .or_else(|| {
+                let name = self.add_query.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            });
+
+        let Some(name) = name else {
+            return;
+        };
+
+        self.metric_config.insert(
+            name.clone(),
+            MetricConfig {
+                name,
+                view: self.add_view,
+                unit: self.add_unit.trim().to_string(),
+            },
+        );
+        self.add_open = false;
+        self.add_query.clear();
+        self.add_unit.clear();
+        self.add_selected = 0;
+        self.add_edit_unit = false;
+        self.sync_viewports();
     }
 
     fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -367,6 +507,55 @@ impl App {
         .into_iter()
         .nth(selected)
     }
+
+    fn add_candidates(&self) -> Vec<&SeenMetric> {
+        let mut metrics = self.seen_metrics.values().collect::<Vec<_>>();
+        metrics.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let query = self.add_query.trim();
+        if query.is_empty() {
+            return metrics;
+        }
+
+        metrics
+            .into_iter()
+            .filter(|metric| seen_metric_matches_query(metric, query))
+            .collect()
+    }
+}
+
+struct SeenMetric {
+    name: String,
+    kind: MetricKind,
+    samples: u64,
+    last_seen: Instant,
+    series: HashSet<String>,
+    example_labels: String,
+}
+
+impl SeenMetric {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            kind: MetricKind::Unknown("?".to_string()),
+            samples: 0,
+            last_seen: Instant::now(),
+            series: HashSet::new(),
+            example_labels: String::new(),
+        }
+    }
+
+    fn push(&mut self, sample: &Sample) {
+        self.kind = sample.kind.clone();
+        self.samples += 1;
+        self.last_seen = sample.received_at;
+        self.series.insert(series_key(&sample.name, &sample.tags));
+
+        let labels = labels_text(&sample.tags);
+        if !labels.is_empty() {
+            self.example_labels = labels;
+        }
+    }
 }
 
 struct MetricState {
@@ -440,6 +629,10 @@ fn render(frame: &mut Frame, app: &mut App) {
     if app.details_open {
         render_details(frame, app);
     }
+
+    if app.add_open {
+        render_add(frame, app);
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -459,6 +652,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" details  "),
         Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" search  "),
+        Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" add  "),
         Span::styled(" +/- ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(format!(
             " chart height {}  listening on {}",
@@ -607,6 +802,138 @@ fn render_details(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn render_add(frame: &mut Frame, app: &App) {
+    let area = bottom_third(frame.area());
+    frame.render_widget(Clear, area);
+
+    let [form_area, list_area, help_area] = area.layout(&Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ]));
+
+    let metric_input = if app.add_query.is_empty() {
+        "<type to filter or enter a new metric>"
+    } else {
+        app.add_query.as_str()
+    };
+    let unit_input = if app.add_unit.is_empty() {
+        "<none>"
+    } else {
+        app.add_unit.as_str()
+    };
+    let active_field = if app.add_edit_unit { "unit" } else { "metric" };
+
+    let form = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("metric ", detail_label_style()),
+            Span::raw(metric_input.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("view ", detail_label_style()),
+            Span::raw(metric_view_name(app.add_view)),
+            Span::styled("  unit ", detail_label_style()),
+            Span::raw(unit_input.to_string()),
+            Span::styled("  editing ", detail_label_style()),
+            Span::raw(active_field),
+        ]),
+    ])
+    .block(
+        Block::bordered()
+            .title(" Add Metric ")
+            .border_style(selected_style(true)),
+    )
+    .wrap(Wrap { trim: true });
+    frame.render_widget(form, form_area);
+
+    let candidates = app.add_candidates();
+    let visible_rows = usize::from(list_area.height.saturating_sub(3)).max(1);
+    let selected = app.add_selected.min(candidates.len().saturating_sub(1));
+    let start = selected.saturating_sub(visible_rows.saturating_sub(1));
+
+    let rows = candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, metric)| {
+            let row = Row::new(vec![
+                Cell::from(metric.name.clone()),
+                Cell::from(metric.kind.to_string()),
+                Cell::from(metric.series.len().to_string()),
+                Cell::from(metric.samples.to_string()),
+                Cell::from(format!("{:.1}s", metric.last_seen.elapsed().as_secs_f64())),
+                Cell::from(if app.metric_config.contains_key(&metric.name) {
+                    "yes"
+                } else {
+                    "no"
+                }),
+                Cell::from(metric.example_labels.clone()),
+            ]);
+
+            if index == selected {
+                row.style(selected_style(true))
+            } else {
+                row
+            }
+        });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Fill(2),
+            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(
+        Row::new([
+            "metric",
+            "kind",
+            "series",
+            "samples",
+            "age",
+            "configured",
+            "example labels",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(Block::bordered().title(format!(
+        " Discovered {}/{} ",
+        candidates.len(),
+        app.seen_metrics.len()
+    )));
+    frame.render_widget(table, list_area);
+
+    let help = Line::from(vec![
+        Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" add  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" cancel  "),
+        Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" unit  "),
+        Span::styled(
+            " Left/Right ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" view  "),
+        Span::styled(
+            " Ctrl-W ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" clear field"),
+    ]);
+    frame.render_widget(help, help_area);
 }
 
 fn search_footer_spans(app: &App) -> Vec<Span<'static>> {
@@ -922,6 +1249,21 @@ fn metric_matches_query(metric: &MetricState, query: &str) -> bool {
         .all(|term| haystack.contains(term))
 }
 
+fn seen_metric_matches_query(metric: &SeenMetric, query: &str) -> bool {
+    let haystack = format!("{} {}", metric.name, metric.example_labels).to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|term| haystack.contains(term))
+}
+
+fn metric_view_name(view: MetricView) -> &'static str {
+    match view {
+        MetricView::Chart => "chart",
+        MetricView::Numeric => "numeric",
+    }
+}
+
 fn series_key(name: &str, tags: &[(String, String)]) -> String {
     let mut key = name.to_string();
     for (tag_key, tag_value) in canonical_tags(tags) {
@@ -1175,5 +1517,61 @@ mod tests {
         let metrics = app.numeric_metrics();
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].labels, "[service:worker]");
+    }
+
+    #[test]
+    fn unconfigured_metrics_are_seen_without_being_tracked() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            metrics: vec![MetricConfig {
+                name: "tracked".to_string(),
+                view: MetricView::Numeric,
+                unit: String::new(),
+            }],
+            ..Config::default()
+        };
+        let mut app = App::new(config, rx);
+
+        tx.send(Sample {
+            name: "untracked".to_string(),
+            value: 1.0,
+            kind: MetricKind::Counter,
+            tags: vec![("service".to_string(), "api".to_string())],
+            received_at: Instant::now(),
+        })
+        .unwrap();
+        app.drain_samples();
+
+        assert!(app.seen_metrics.contains_key("untracked"));
+        assert!(app.metrics.is_empty());
+    }
+
+    #[test]
+    fn add_promotes_seen_metric_to_runtime_config() {
+        let (_tx, rx) = mpsc::channel();
+        let config = Config {
+            metrics: vec![MetricConfig {
+                name: "tracked".to_string(),
+                view: MetricView::Numeric,
+                unit: String::new(),
+            }],
+            ..Config::default()
+        };
+        let mut app = App::new(config, rx);
+
+        app.seen_metrics.insert(
+            "untracked".to_string(),
+            SeenMetric::new("untracked".to_string()),
+        );
+        app.add_query = "untracked".to_string();
+        app.add_view = MetricView::Chart;
+        app.add_unit = "rows".to_string();
+
+        app.add_selected_metric();
+
+        let added = app.metric_config.get("untracked").unwrap();
+        assert_eq!(added.view, MetricView::Chart);
+        assert_eq!(added.unit, "rows");
+        assert!(app.should_track("untracked"));
     }
 }
