@@ -53,8 +53,13 @@ Both lines match `name = "requests"`, but render as separate labelled rows/chart
 - Up/Down or `j`/`k`: move the selected metric.
 - PageUp/PageDown: page by the visible item count.
 - Home/End: jump to first/last item in the focused pane.
+- `/`: filter metrics by name or labels.
 - `+`/`-`: increase/decrease chart height.
 - Enter: open the selected metric details pane.
+- Enter while searching: keep the current filter.
+- Esc while searching: stop editing and keep the current filter.
+- Ctrl-W while searching: clear the filter input.
+- `c` with an active filter: clear the current filter.
 - Esc or Enter: close the details pane.
 - `q` or Ctrl-C: quit.
 

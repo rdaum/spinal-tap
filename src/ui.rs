@@ -91,6 +91,8 @@ struct App {
     chart_page: usize,
     chart_height: u16,
     details_open: bool,
+    search_active: bool,
+    search_query: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -118,6 +120,8 @@ impl App {
             chart_page: 1,
             chart_height: DEFAULT_CHART_HEIGHT,
             details_open: false,
+            search_active: false,
+            search_query: String::new(),
         }
     }
 
@@ -157,6 +161,10 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.search_active {
+            return self.handle_search_key(code, modifiers);
+        }
+
         if self.details_open {
             if matches!(code, KeyCode::Enter | KeyCode::Esc) {
                 self.details_open = false;
@@ -174,6 +182,11 @@ impl App {
 
         match code {
             KeyCode::Enter => self.details_open = self.selected_metric().is_some(),
+            KeyCode::Char('/') => self.search_active = true,
+            KeyCode::Char('c' | 'C') if !self.search_query.is_empty() => {
+                self.search_query.clear();
+                self.sync_viewports();
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.toggle_focus(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selected(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selected(-1),
@@ -183,6 +196,32 @@ impl App {
             KeyCode::End => self.select_end(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.resize_charts(1),
             KeyCode::Char('-') | KeyCode::Char('_') => self.resize_charts(-1),
+            _ => {}
+        }
+
+        false
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+
+        match code {
+            KeyCode::Enter => self.search_active = false,
+            KeyCode::Esc => self.search_active = false,
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.sync_viewports();
+            }
+            KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.clear();
+                self.sync_viewports();
+            }
+            KeyCode::Char(ch) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                self.search_query.push(ch);
+                self.sync_viewports();
+            }
             _ => {}
         }
 
@@ -277,22 +316,42 @@ impl App {
     }
 
     fn numeric_metric_count(&self) -> usize {
-        sorted_metrics(self)
-            .into_iter()
-            .filter(|metric| self.numeric_filter(metric))
-            .count()
+        self.numeric_metrics().len()
     }
 
     fn chart_metric_count(&self) -> usize {
-        sorted_metrics(self)
-            .into_iter()
-            .filter(|metric| self.configured_view(&metric.name) == MetricView::Chart)
-            .count()
+        self.chart_metrics().len()
     }
 
     fn numeric_filter(&self, metric: &MetricState) -> bool {
-        self.configured_view(&metric.name) == MetricView::Numeric
-            || (self.metric_config.is_empty() && self.chart_metric_count() == 0)
+        self.configured_view(&metric.name) == MetricView::Numeric && self.matches_search(metric)
+    }
+
+    fn chart_filter(&self, metric: &MetricState) -> bool {
+        self.configured_view(&metric.name) == MetricView::Chart && self.matches_search(metric)
+    }
+
+    fn numeric_metrics(&self) -> Vec<&MetricState> {
+        sorted_metrics(self)
+            .into_iter()
+            .filter(|metric| self.numeric_filter(metric))
+            .collect()
+    }
+
+    fn chart_metrics(&self) -> Vec<&MetricState> {
+        sorted_metrics(self)
+            .into_iter()
+            .filter(|metric| self.chart_filter(metric))
+            .collect()
+    }
+
+    fn matches_search(&self, metric: &MetricState) -> bool {
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            return true;
+        }
+
+        metric_matches_query(metric, query)
     }
 
     fn selected_metric(&self) -> Option<&MetricState> {
@@ -301,13 +360,12 @@ impl App {
             Focus::Charts => self.chart_selected,
         };
 
-        sorted_metrics(self)
-            .into_iter()
-            .filter(|metric| match self.focus {
-                Focus::Numeric => self.numeric_filter(metric),
-                Focus::Charts => self.configured_view(&metric.name) == MetricView::Chart,
-            })
-            .nth(selected)
+        match self.focus {
+            Focus::Numeric => self.numeric_metrics(),
+            Focus::Charts => self.chart_metrics(),
+        }
+        .into_iter()
+        .nth(selected)
     }
 }
 
@@ -377,7 +435,17 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_numeric(frame, numeric_area, app);
     render_charts(frame, chart_area, app);
 
-    let footer_text = Line::from(vec![
+    render_footer(frame, footer, app);
+
+    if app.details_open {
+        render_details(frame, app);
+    }
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+
+    let mut spans = vec![
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit  "),
         Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -389,17 +457,21 @@ fn render(frame: &mut Frame, app: &mut App) {
         Span::raw(" page  "),
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" details  "),
+        Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" search  "),
         Span::styled(" +/- ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(format!(
             " chart height {}  listening on {}",
             app.chart_height, app.config.listen
         )),
-    ]);
-    frame.render_widget(footer_text, footer);
+    ];
 
-    if app.details_open {
-        render_details(frame, app);
+    if app.search_active || !app.search_query.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(search_footer_spans(app));
     }
+
+    frame.render_widget(Line::from(spans), area);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -537,15 +609,51 @@ fn render_details(frame: &mut Frame, app: &App) {
     );
 }
 
+fn search_footer_spans(app: &App) -> Vec<Span<'static>> {
+    let marker = if app.search_active { "/" } else { "filter" };
+    let text = if app.search_active {
+        format!("/{:<width$}", app.search_query, width = 20)
+    } else {
+        format!("filter: {}", app.search_query)
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {marker} "),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+        Span::raw(format!(" {text} ")),
+        Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" keep  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" stop"),
+    ];
+
+    if app.search_active {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " Ctrl-W ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ));
+        spans.push(Span::raw(" clear input"));
+    } else {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " c ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ));
+        spans.push(Span::raw(" clear filter"));
+    }
+
+    spans
+}
+
 fn render_numeric(frame: &mut Frame, area: Rect, app: &mut App) {
     let visible_rows = usize::from(area.height.saturating_sub(3)).max(1);
     app.numeric_page = visible_rows;
     app.sync_viewports();
 
-    let metrics = sorted_metrics(app)
-        .into_iter()
-        .filter(|metric| app.numeric_filter(metric))
-        .collect::<Vec<_>>();
+    let metrics = app.numeric_metrics();
 
     let start = app.numeric_scroll.min(metrics.len().saturating_sub(1));
     let end = (start + visible_rows).min(metrics.len());
@@ -608,14 +716,16 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
     app.chart_page = visible_count;
     app.sync_viewports();
 
-    let charted = sorted_metrics(app)
-        .into_iter()
-        .filter(|metric| app.configured_view(&metric.name) == MetricView::Chart)
-        .collect::<Vec<_>>();
+    let charted = app.chart_metrics();
 
     if charted.is_empty() {
+        let message = if app.search_query.trim().is_empty() {
+            "No chart metrics configured yet."
+        } else {
+            "No chart metrics match the current search."
+        };
         frame.render_widget(
-            Paragraph::new("No chart metrics configured yet.")
+            Paragraph::new(message)
                 .block(Block::bordered().title(" Charts "))
                 .wrap(Wrap { trim: true }),
             area,
@@ -802,6 +912,14 @@ fn metric_chart_title(metric: &MetricState) -> String {
     } else {
         format!("{} {}", metric.name, metric.labels)
     }
+}
+
+fn metric_matches_query(metric: &MetricState, query: &str) -> bool {
+    let haystack = format!("{} {}", metric.name, metric.labels).to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|term| haystack.contains(term))
 }
 
 fn series_key(name: &str, tags: &[(String, String)]) -> String {
@@ -1024,5 +1142,38 @@ mod tests {
             );
 
         assert_eq!(app.metrics.len(), 2);
+    }
+
+    #[test]
+    fn search_matches_metric_name_and_labels() {
+        let metric = MetricState::new(
+            "buffer_pool_dirty_wal_page_image_pages".to_string(),
+            "[page_kind:leaf_index, service:boxter]".to_string(),
+            8,
+        );
+
+        assert!(metric_matches_query(&metric, "dirty leaf"));
+        assert!(metric_matches_query(&metric, "SERVICE:BOXTER"));
+        assert!(!metric_matches_query(&metric, "resident"));
+    }
+
+    #[test]
+    fn search_filters_metric_lists() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), rx);
+
+        app.metrics.insert(
+            "requests|service=api".to_string(),
+            MetricState::new("requests".to_string(), "[service:api]".to_string(), 8),
+        );
+        app.metrics.insert(
+            "requests|service=worker".to_string(),
+            MetricState::new("requests".to_string(), "[service:worker]".to_string(), 8),
+        );
+        app.search_query = "worker".to_string();
+
+        let metrics = app.numeric_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].labels, "[service:worker]");
     }
 }
