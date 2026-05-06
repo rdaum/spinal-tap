@@ -17,9 +17,9 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -31,21 +31,48 @@ pub struct Config {
     pub metrics: Vec<MetricConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MetricConfig {
     pub name: String,
     #[serde(default)]
     pub view: MetricView,
     #[serde(default)]
+    pub kind: MetricKindConfig,
+    #[serde(default)]
+    pub display: MetricDisplay,
+    #[serde(default)]
     pub unit: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MetricView {
     Chart,
     #[default]
     Numeric,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MetricKindConfig {
+    #[default]
+    Auto,
+    Counter,
+    Gauge,
+    Histogram,
+    Timer,
+    Distribution,
+    Set,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MetricDisplay {
+    #[default]
+    Default,
+    Latest,
+    Total,
+    Rate,
 }
 
 impl Config {
@@ -100,4 +127,25 @@ fn default_history_points() -> usize {
 
 fn default_redraw_millis() -> u64 {
     250
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_kind_and_display_default_for_existing_configs() {
+        let config: Config = toml::from_str(
+            r#"
+            [[metrics]]
+            name = "requests"
+            view = "chart"
+            unit = "req"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.metrics[0].kind, MetricKindConfig::Auto);
+        assert_eq!(config.metrics[0].display, MetricDisplay::Default);
+    }
 }

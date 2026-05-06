@@ -19,6 +19,9 @@ cargo run --release -- config.example.toml
 By default, if no config path is passed, `spinal-tap` looks for `spinal-tap.toml`. If that file is
 missing, it starts with defaults and listens on `127.0.0.1:8125`.
 
+Runtime changes can be saved back to the startup config path with Ctrl-X then Ctrl-S, or Ctrl-X then
+`s`. If the app was started without a config path, this writes `spinal-tap.toml`.
+
 ## Config
 
 ```toml
@@ -29,11 +32,15 @@ redraw_millis = 250
 [[metrics]]
 name = "requests"
 view = "chart"
+kind = "counter"
+display = "rate"
 unit = "req"
 
 [[metrics]]
 name = "queue.depth"
 view = "numeric"
+kind = "gauge"
+display = "latest"
 unit = "jobs"
 ```
 
@@ -47,6 +54,10 @@ requests:1|c|#service:worker,host:b
 
 Both lines match `name = "requests"`, but render as separate labelled rows/charts.
 
+`kind` defaults to `auto`, which uses the kind from received DogStatsD samples. Set it explicitly
+when adding a metric before samples arrive. `display` defaults to the current latest-sample view;
+use `rate` for counters, or `latest`/`total` when you want that value plotted or shown as primary.
+
 ## Controls
 
 - `Tab`, Left, Right: switch focus between numeric and chart panes.
@@ -55,18 +66,20 @@ Both lines match `name = "requests"`, but render as separate labelled rows/chart
 - Home/End: jump to first/last item in the focused pane.
 - `/`: filter metrics by name or labels.
 - `a`: add a metric from discovered traffic or a typed base metric name.
+- Ctrl-X then Ctrl-S, or Ctrl-X then `s`: save the current runtime metric config.
 - `+`/`-`: increase/decrease chart height.
 - Enter: open the selected metric details pane.
 - Enter while searching: keep the current filter.
 - Esc while searching: stop editing and keep the current filter.
 - Ctrl-W while searching: clear the filter input.
 - `c` with an active filter: clear the current filter.
-- In the add pane, Up/Down selects a discovered metric, Left/Right toggles numeric/chart, Tab edits
-  units, Ctrl-W clears the active field, Enter adds, and Esc cancels.
+- In the add pane, Up/Down selects a discovered metric, Tab moves between fields, Left/Right changes
+  view/kind/display, Ctrl-V cycles numeric/chart, Ctrl-K cycles kind, Ctrl-D cycles display, Ctrl-W
+  clears text fields, Enter adds, and Esc cancels.
 - In the details pane, `d` removes the selected base metric and all of its labelled series from the
   live dashboard.
 - Esc or Enter: close the details pane.
-- `q` or Ctrl-C: quit.
+- `q`, Ctrl-C, or Ctrl-X then Ctrl-C: quit.
 
 ## Scope
 
@@ -80,9 +93,8 @@ The current focus is fast, low-overhead live visibility for e.g. debugging or qu
 If you want more than this you probably want a real metrics collector, but I'm open to additions
 where they keep the lightweight focus. Some features I want to add include:
 
-- Saving dynamically added metrics back to config
-- Searching for metrics
 - Adjust series ring buffer size
+- Load or switch config from inside the app
 - Reset / flush metric
 
 ## License

@@ -12,7 +12,9 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -26,16 +28,16 @@ use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
 };
 
-use crate::config::{Config, MetricConfig, MetricView};
+use crate::config::{Config, MetricConfig, MetricDisplay, MetricKindConfig, MetricView};
 use crate::dogstatsd::{MetricKind, Sample};
 
 const DEFAULT_CHART_HEIGHT: u16 = 9;
 const MIN_CHART_HEIGHT: u16 = 6;
 const MAX_CHART_HEIGHT: u16 = 24;
 
-pub fn run(config: Config, rx: Receiver<Sample>) -> io::Result<()> {
+pub fn run(config: Config, config_path: PathBuf, rx: Receiver<Sample>) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, App::new(config, rx));
+    let result = run_app(&mut terminal, App::new(config, config_path, rx));
     ratatui::restore();
     result
 }
@@ -77,6 +79,7 @@ fn handle_events(app: &mut App, timeout: Duration) -> io::Result<bool> {
 
 struct App {
     config: Config,
+    config_path: PathBuf,
     rx: Receiver<Sample>,
     metrics: HashMap<String, MetricState>,
     seen_metrics: HashMap<String, SeenMetric>,
@@ -100,22 +103,36 @@ struct App {
     add_query: String,
     add_selected: usize,
     add_view: MetricView,
+    add_kind: MetricKindConfig,
+    add_display: MetricDisplay,
     add_unit: String,
-    add_edit_unit: bool,
+    add_field: AddField,
+    ctrl_x_armed: bool,
+    status_message: Option<String>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Numeric,
     Charts,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AddField {
+    Metric,
+    View,
+    Kind,
+    Display,
+    Unit,
+}
+
 impl App {
-    fn new(config: Config, rx: Receiver<Sample>) -> Self {
+    fn new(config: Config, config_path: PathBuf, rx: Receiver<Sample>) -> Self {
         let metric_config = config.metric_map();
         let track_all = metric_config.is_empty();
-        Self {
+        let mut app = Self {
             config,
+            config_path,
             rx,
             metrics: HashMap::new(),
             seen_metrics: HashMap::new(),
@@ -139,9 +156,15 @@ impl App {
             add_query: String::new(),
             add_selected: 0,
             add_view: MetricView::Numeric,
+            add_kind: MetricKindConfig::Auto,
+            add_display: MetricDisplay::Default,
             add_unit: String::new(),
-            add_edit_unit: false,
-        }
+            add_field: AddField::Metric,
+            ctrl_x_armed: false,
+            status_message: None,
+        };
+        app.ensure_config_placeholders();
+        app
     }
 
     fn drain_samples(&mut self) {
@@ -155,6 +178,7 @@ impl App {
             let key = series_key(&sample.name, &sample.tags);
             let name = sample.name.clone();
             let labels = labels_text(&sample.tags);
+            self.remove_empty_base_placeholder(&name, &sample.tags);
             self.metrics
                 .entry(key)
                 .or_insert_with(|| MetricState::new(name, labels, history_points))
@@ -167,6 +191,21 @@ impl App {
             .entry(sample.name.clone())
             .or_insert_with(|| SeenMetric::new(sample.name.clone()))
             .push(sample);
+    }
+
+    fn remove_empty_base_placeholder(&mut self, name: &str, tags: &[(String, String)]) {
+        if tags.is_empty() {
+            return;
+        }
+
+        let base_key = series_key(name, &[]);
+        if self
+            .metrics
+            .get(&base_key)
+            .is_some_and(|metric| metric.samples.is_empty())
+        {
+            self.metrics.remove(&base_key);
+        }
     }
 
     fn should_track(&self, name: &str) -> bool {
@@ -188,7 +227,31 @@ impl App {
             .unwrap_or("")
     }
 
+    fn configured_kind(&self, name: &str) -> MetricKindConfig {
+        self.metric_config
+            .get(name)
+            .map(|config| config.kind)
+            .unwrap_or(MetricKindConfig::Auto)
+    }
+
+    fn display_mode(&self, name: &str) -> MetricDisplay {
+        self.metric_config
+            .get(name)
+            .map(|config| config.display)
+            .unwrap_or(MetricDisplay::Default)
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.ctrl_x_armed {
+            return self.handle_ctrl_x_key(code, modifiers);
+        }
+
+        if is_ctrl_x(code, modifiers) {
+            self.ctrl_x_armed = true;
+            self.status_message = Some("C-x".to_string());
+            return false;
+        }
+
         if self.add_open {
             return self.handle_add_key(code, modifiers);
         }
@@ -249,34 +312,54 @@ impl App {
             return true;
         }
 
+        if code == KeyCode::Char('v') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.add_view = next_metric_view(self.add_view, 1);
+            return false;
+        }
+
+        if code == KeyCode::Char('k') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.add_kind = next_metric_kind_config(self.add_kind, 1);
+            return false;
+        }
+
+        if code == KeyCode::Char('d') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.add_display = next_metric_display(self.add_display, 1);
+            return false;
+        }
+
         match code {
             KeyCode::Esc => self.add_open = false,
             KeyCode::Enter => self.add_selected_metric(),
-            KeyCode::Tab => self.add_edit_unit = !self.add_edit_unit,
-            KeyCode::Left | KeyCode::Right => self.toggle_add_view(),
+            KeyCode::Tab => self.next_add_field(),
+            KeyCode::Left => self.adjust_add_field(-1),
+            KeyCode::Right => self.adjust_add_field(1),
             KeyCode::Down => self.move_add_selection(1),
             KeyCode::Up => self.move_add_selection(-1),
-            KeyCode::Backspace if self.add_edit_unit => {
+            KeyCode::Backspace if self.add_field == AddField::Unit => {
                 self.add_unit.pop();
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if self.add_field == AddField::Metric => {
                 self.add_query.pop();
                 self.clamp_add_selection();
             }
             KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.add_edit_unit {
-                    self.add_unit.clear();
-                } else {
-                    self.add_query.clear();
-                    self.clamp_add_selection();
+                match self.add_field {
+                    AddField::Metric => {
+                        self.add_query.clear();
+                        self.clamp_add_selection();
+                    }
+                    AddField::Unit => self.add_unit.clear(),
+                    AddField::View | AddField::Kind | AddField::Display => {}
                 }
             }
             KeyCode::Char(ch) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                if self.add_edit_unit {
-                    self.add_unit.push(ch);
-                } else {
-                    self.add_query.push(ch);
-                    self.clamp_add_selection();
+                match self.add_field {
+                    AddField::Metric => {
+                        self.add_query.push(ch);
+                        self.clamp_add_selection();
+                    }
+                    AddField::Unit => self.add_unit.push(ch),
+                    AddField::View | AddField::Kind | AddField::Display => {}
                 }
             }
             _ => {}
@@ -290,15 +373,31 @@ impl App {
         self.add_query.clear();
         self.add_selected = 0;
         self.add_view = MetricView::Numeric;
+        self.add_kind = MetricKindConfig::Auto;
+        self.add_display = MetricDisplay::Default;
         self.add_unit.clear();
-        self.add_edit_unit = false;
+        self.add_field = AddField::Metric;
     }
 
-    fn toggle_add_view(&mut self) {
-        self.add_view = match self.add_view {
-            MetricView::Chart => MetricView::Numeric,
-            MetricView::Numeric => MetricView::Chart,
+    fn next_add_field(&mut self) {
+        self.add_field = match self.add_field {
+            AddField::Metric => AddField::View,
+            AddField::View => AddField::Kind,
+            AddField::Kind => AddField::Display,
+            AddField::Display => AddField::Unit,
+            AddField::Unit => AddField::Metric,
         };
+    }
+
+    fn adjust_add_field(&mut self, direction: isize) {
+        match self.add_field {
+            AddField::View => self.add_view = next_metric_view(self.add_view, direction),
+            AddField::Kind => self.add_kind = next_metric_kind_config(self.add_kind, direction),
+            AddField::Display => {
+                self.add_display = next_metric_display(self.add_display, direction)
+            }
+            AddField::Metric | AddField::Unit => {}
+        }
     }
 
     fn move_add_selection(&mut self, delta: isize) {
@@ -325,14 +424,14 @@ impl App {
     }
 
     fn add_selected_metric(&mut self) {
-        let name = self
+        let selected = self
             .add_candidates()
             .get(self.add_selected)
-            .map(|metric| metric.name.clone())
-            .or_else(|| {
-                let name = self.add_query.trim();
-                (!name.is_empty()).then(|| name.to_string())
-            });
+            .map(|metric| (metric.name.clone(), metric.kind.clone()));
+        let name = selected.as_ref().map(|(name, _)| name.clone()).or_else(|| {
+            let name = self.add_query.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        });
 
         let Some(name) = name else {
             return;
@@ -342,17 +441,52 @@ impl App {
         self.metric_config.insert(
             name.clone(),
             MetricConfig {
-                name,
+                name: name.clone(),
                 view: self.add_view,
+                kind: self.add_kind,
+                display: self.add_display,
                 unit: self.add_unit.trim().to_string(),
             },
         );
+        let placeholder_kind = if self.add_kind == MetricKindConfig::Auto {
+            selected
+                .as_ref()
+                .map(|(_, kind)| metric_kind_config_from_metric_kind(kind))
+                .unwrap_or(MetricKindConfig::Auto)
+        } else {
+            self.add_kind
+        };
+        self.ensure_placeholder_metric(&name, placeholder_kind);
         self.add_open = false;
         self.add_query.clear();
         self.add_unit.clear();
         self.add_selected = 0;
-        self.add_edit_unit = false;
-        self.sync_viewports();
+        self.add_field = AddField::Metric;
+        self.select_metric_by_name(&name);
+    }
+
+    fn ensure_placeholder_metric(&mut self, name: &str, kind: MetricKindConfig) {
+        if self.metrics.values().any(|metric| metric.name == name) {
+            return;
+        }
+
+        let mut metric = MetricState::new(
+            name.to_string(),
+            String::new(),
+            self.config.history_points(),
+        );
+        if let Some(kind) = metric_kind_from_config(kind) {
+            metric.kind = kind;
+        }
+
+        self.metrics.insert(series_key(name, &[]), metric);
+    }
+
+    fn ensure_config_placeholders(&mut self) {
+        let configs = self.metric_config.values().cloned().collect::<Vec<_>>();
+        for config in configs {
+            self.ensure_placeholder_metric(&config.name, config.kind);
+        }
     }
 
     fn remove_metric(&mut self, name: &str) {
@@ -361,6 +495,85 @@ impl App {
         self.metrics.retain(|_, metric| metric.name != name);
         self.details_open = false;
         self.sync_viewports();
+    }
+
+    fn handle_ctrl_x_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if is_ctrl_x(code, modifiers) {
+            self.status_message = Some("C-x".to_string());
+            return false;
+        }
+
+        self.ctrl_x_armed = false;
+        match code {
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Char('s' | 'S')
+                if modifiers.is_empty()
+                    || modifiers == KeyModifiers::SHIFT
+                    || modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.save_config()
+            }
+            KeyCode::Esc => self.status_message = Some("C-x canceled".to_string()),
+            _ => self.status_message = Some("unknown C-x command".to_string()),
+        }
+
+        false
+    }
+
+    fn save_config(&mut self) {
+        let path = self.config_path.display().to_string();
+        match self.write_config() {
+            Ok(()) => self.status_message = Some(format!("saved {path}")),
+            Err(err) => self.status_message = Some(format!("save failed: {err}")),
+        }
+    }
+
+    fn write_config(&self) -> io::Result<()> {
+        if let Some(parent) = self
+            .config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let contents = toml::to_string_pretty(&self.config_for_save()).map_err(io::Error::other)?;
+        fs::write(&self.config_path, contents)
+    }
+
+    fn config_for_save(&self) -> Config {
+        let mut metric_config = self.metric_config.clone();
+
+        if self.track_all {
+            for metric in self.metrics.values() {
+                if self.hidden_metrics.contains(&metric.name) {
+                    continue;
+                }
+
+                metric_config
+                    .entry(metric.name.clone())
+                    .or_insert_with(|| MetricConfig {
+                        name: metric.name.clone(),
+                        view: self.configured_view(&metric.name),
+                        kind: metric_kind_config_from_metric_kind(&metric.kind),
+                        display: self.display_mode(&metric.name),
+                        unit: self.unit(&metric.name).to_string(),
+                    });
+            }
+        }
+
+        let mut metrics = metric_config
+            .into_values()
+            .filter(|metric| !self.hidden_metrics.contains(&metric.name))
+            .collect::<Vec<_>>();
+        metrics.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Config {
+            listen: self.config.listen.clone(),
+            history_points: self.config.history_points,
+            redraw_millis: self.config.redraw_millis,
+            metrics,
+        }
     }
 
     fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -529,6 +742,28 @@ impl App {
         .nth(selected)
     }
 
+    fn select_metric_by_name(&mut self, name: &str) {
+        self.focus = match self.configured_view(name) {
+            MetricView::Numeric => Focus::Numeric,
+            MetricView::Chart => Focus::Charts,
+        };
+
+        match self.focus {
+            Focus::Numeric => {
+                if let Some(index) = metric_index_by_name(&self.numeric_metrics(), name) {
+                    self.numeric_selected = index;
+                }
+            }
+            Focus::Charts => {
+                if let Some(index) = metric_index_by_name(&self.chart_metrics(), name) {
+                    self.chart_selected = index;
+                }
+            }
+        }
+
+        self.sync_viewports();
+    }
+
     fn add_candidates(&self) -> Vec<&SeenMetric> {
         let mut metrics = self.seen_metrics.values().collect::<Vec<_>>();
         metrics.sort_by(|a, b| a.name.cmp(&b.name));
@@ -605,6 +840,18 @@ impl MetricState {
     }
 
     fn push(&mut self, sample: Sample, history_points: usize) {
+        let rate_per_sec =
+            if matches!(&sample.kind, MetricKind::Counter) && !self.samples.is_empty() {
+                sample
+                    .received_at
+                    .checked_duration_since(self.last_seen)
+                    .map(|duration| duration.as_secs_f64())
+                    .filter(|seconds| *seconds > 0.0)
+                    .map(|seconds| sample.value / seconds)
+            } else {
+                None
+            };
+
         self.kind = sample.kind;
         self.latest = sample.value;
         if self.kind == MetricKind::Counter {
@@ -615,7 +862,9 @@ impl MetricState {
         self.last_seen = sample.received_at;
         self.tags = sample.tags;
         self.samples.push_back(Point {
-            value: sample.value,
+            latest: sample.value,
+            total: self.total,
+            rate_per_sec,
         });
 
         while self.samples.len() > history_points {
@@ -626,7 +875,9 @@ impl MetricState {
 
 #[derive(Clone, Copy)]
 struct Point {
-    value: f64,
+    latest: f64,
+    total: f64,
+    rate_per_sec: Option<f64>,
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
@@ -675,12 +926,25 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" search  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" add  "),
+        Span::styled(" C-x s ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" save  "),
         Span::styled(" +/- ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(format!(
             " chart height {}  listening on {}",
             app.chart_height, app.config.listen
         )),
     ];
+
+    if app.ctrl_x_armed {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " C-x ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+        spans.push(Span::raw(" s save  Esc cancel"));
+    } else if let Some(message) = &app.status_message {
+        spans.push(Span::raw(format!("  {message}")));
+    }
 
     if app.search_active || !app.search_query.is_empty() {
         spans.push(Span::raw("  "));
@@ -731,6 +995,7 @@ fn render_details(frame: &mut Frame, app: &App) {
     let unit = app.unit(&metric.name);
     let configured = app.metric_config.contains_key(&metric.name);
     let view = app.configured_view(&metric.name);
+    let display = app.display_mode(&metric.name);
     let stats = retained_stats(metric);
     let delta = retained_delta(metric);
     let tags = if metric.tags.is_empty() {
@@ -754,20 +1019,22 @@ fn render_details(frame: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("kind ", detail_label_style()),
-            Span::raw(metric.kind.to_string()),
+            Span::raw(effective_metric_kind_name(app, metric)),
             Span::styled("  view ", detail_label_style()),
             Span::raw(match view {
                 MetricView::Chart => "chart",
                 MetricView::Numeric => "numeric",
             }),
+            Span::styled("  display ", detail_label_style()),
+            Span::raw(metric_display_name(display)),
             Span::styled("  unit ", detail_label_style()),
             Span::raw(if unit.is_empty() { "none" } else { unit }),
             Span::styled("  configured ", detail_label_style()),
             Span::raw(if configured { "yes" } else { "auto" }),
         ]),
         Line::from(vec![
-            Span::styled("latest ", detail_label_style()),
-            Span::raw(format_value(metric.latest, unit)),
+            Span::styled("value ", detail_label_style()),
+            Span::raw(format_display_value(metric, display, unit)),
             Span::styled("  total ", detail_label_style()),
             Span::raw(format_value(metric.total, unit)),
             Span::styled("  delta ", detail_label_style()),
@@ -830,7 +1097,7 @@ fn render_add(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let [form_area, list_area, help_area] = area.layout(&Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Fill(1),
         Constraint::Length(1),
     ]));
@@ -845,18 +1112,24 @@ fn render_add(frame: &mut Frame, app: &App) {
     } else {
         app.add_unit.as_str()
     };
-    let active_field = if app.add_edit_unit { "unit" } else { "metric" };
+    let active_field = add_field_name(app.add_field);
 
     let form = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("metric ", detail_label_style()),
-            Span::raw(metric_input.to_string()),
+            add_field_value_span(app, AddField::Metric, metric_input),
         ]),
         Line::from(vec![
             Span::styled("view ", detail_label_style()),
-            Span::raw(metric_view_name(app.add_view)),
-            Span::styled("  unit ", detail_label_style()),
-            Span::raw(unit_input.to_string()),
+            add_field_value_span(app, AddField::View, metric_view_name(app.add_view)),
+            Span::styled("  kind ", detail_label_style()),
+            add_field_value_span(app, AddField::Kind, metric_kind_config_name(app.add_kind)),
+            Span::styled("  display ", detail_label_style()),
+            add_field_value_span(app, AddField::Display, metric_display_name(app.add_display)),
+        ]),
+        Line::from(vec![
+            Span::styled("unit ", detail_label_style()),
+            add_field_value_span(app, AddField::Unit, unit_input),
             Span::styled("  editing ", detail_label_style()),
             Span::raw(active_field),
         ]),
@@ -942,17 +1215,32 @@ fn render_add(frame: &mut Frame, app: &App) {
         Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" cancel  "),
         Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" unit  "),
+        Span::raw(" field  "),
         Span::styled(
             " Left/Right ",
             Style::default().fg(Color::Black).bg(Color::Gray),
         ),
+        Span::raw(" change  "),
+        Span::styled(
+            " Ctrl-V ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
         Span::raw(" view  "),
+        Span::styled(
+            " Ctrl-K ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" kind  "),
+        Span::styled(
+            " Ctrl-D ",
+            Style::default().fg(Color::Black).bg(Color::Gray),
+        ),
+        Span::raw(" display  "),
         Span::styled(
             " Ctrl-W ",
             Style::default().fg(Color::Black).bg(Color::Gray),
         ),
-        Span::raw(" clear field"),
+        Span::raw(" clear text"),
     ]);
     frame.render_widget(help, help_area);
 }
@@ -1013,11 +1301,12 @@ fn render_numeric(frame: &mut Frame, area: Rect, app: &mut App) {
         .take(visible_rows)
         .map(|(index, metric)| {
             let unit = app.unit(&metric.name);
+            let display = app.display_mode(&metric.name);
             let display_name = grouped_metric_name(&metrics, index);
             let row = Row::new(vec![
                 Cell::from(display_name),
-                Cell::from(metric.kind.to_string()),
-                Cell::from(format_value(metric.latest, unit)),
+                Cell::from(metric_kind_display(app, metric)),
+                Cell::from(format_display_value(metric, display, unit)),
                 Cell::from(format_value(metric.total, unit)),
                 Cell::from(format!("{:.1}s", metric.last_seen.elapsed().as_secs_f64())),
             ]);
@@ -1041,14 +1330,14 @@ fn render_numeric(frame: &mut Frame, area: Rect, app: &mut App) {
         rows,
         [
             Constraint::Fill(1),
-            Constraint::Length(10),
-            Constraint::Length(16),
-            Constraint::Length(16),
+            Constraint::Length(14),
+            Constraint::Length(14),
+            Constraint::Length(14),
             Constraint::Length(7),
         ],
     )
     .header(
-        Row::new(["metric", "kind", "latest", "total", "age"]).style(
+        Row::new(["metric", "kind", "value", "total", "age"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1107,6 +1396,8 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
             area,
             metric,
             unit: app.unit(&metric.name),
+            display: app.display_mode(&metric.name),
+            kind_label: effective_metric_kind_name(app, metric),
             history_points: app.config.history_points(),
             pane_title,
             selected,
@@ -1134,6 +1425,8 @@ struct ChartRender<'a, 'b> {
     area: Rect,
     metric: &'a MetricState,
     unit: &'a str,
+    display: MetricDisplay,
+    kind_label: String,
     history_points: usize,
     pane_title: Option<String>,
     selected: bool,
@@ -1146,55 +1439,61 @@ fn render_chart(args: ChartRender<'_, '_>) {
         area,
         metric,
         unit,
+        display,
+        kind_label,
         history_points,
         pane_title,
         selected,
         focused,
     } = args;
 
-    if metric.samples.is_empty() {
-        return;
-    }
-
     let history_points = history_points.max(2);
     let data = metric
         .samples
         .iter()
         .enumerate()
-        .map(|(index, point)| (index as f64 + 0.5, point.value))
+        .filter_map(|(index, point)| {
+            point_display_value(point, display).map(|value| (index as f64 + 0.5, value))
+        })
         .collect::<Vec<_>>();
 
-    let min_y = data
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::INFINITY, f64::min);
-    let max_y = data
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let y_pad = ((max_y - min_y) * 0.1).max(1.0);
-    let y_bounds = [min_y - y_pad, max_y + y_pad];
+    let y_bounds = if data.is_empty() {
+        [0.0, 1.0]
+    } else {
+        let min_y = data
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = data
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let y_pad = ((max_y - min_y) * 0.1).max(1.0);
+        [min_y - y_pad, max_y + y_pad]
+    };
     let x_bounds = [0.0, history_points as f64];
 
-    let dataset = Dataset::default()
-        .name(metric_chart_title(metric))
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(if selected { Color::Yellow } else { Color::Cyan })
-        .data(&data);
-
-    let y_title = if unit.is_empty() {
-        metric.kind.to_string()
+    let datasets = if data.is_empty() {
+        Vec::new()
     } else {
-        format!("{} ({unit})", metric.kind)
+        vec![
+            Dataset::default()
+                .name(metric_chart_title(metric))
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(if selected { Color::Yellow } else { Color::Cyan })
+                .data(&data),
+        ]
     };
+
+    let y_title = chart_axis_title(&kind_label, display, unit);
 
     let title = match pane_title {
         Some(pane_title) => format!("{pane_title}  {}", metric_chart_title(metric)),
         None => format!(" {} ", metric_chart_title(metric)),
     };
 
-    let chart = Chart::new(vec![dataset])
+    let chart = Chart::new(datasets)
         .block(Block::bordered().title(title).border_style(if selected {
             selected_style(focused)
         } else {
@@ -1285,6 +1584,180 @@ fn metric_view_name(view: MetricView) -> &'static str {
     }
 }
 
+fn metric_kind_config_name(kind: MetricKindConfig) -> &'static str {
+    match kind {
+        MetricKindConfig::Auto => "auto",
+        MetricKindConfig::Counter => "counter",
+        MetricKindConfig::Gauge => "gauge",
+        MetricKindConfig::Histogram => "histogram",
+        MetricKindConfig::Timer => "timer",
+        MetricKindConfig::Distribution => "distribution",
+        MetricKindConfig::Set => "set",
+    }
+}
+
+fn metric_display_name(display: MetricDisplay) -> &'static str {
+    match display {
+        MetricDisplay::Default => "default",
+        MetricDisplay::Latest => "latest",
+        MetricDisplay::Total => "total",
+        MetricDisplay::Rate => "rate",
+    }
+}
+
+fn add_field_name(field: AddField) -> &'static str {
+    match field {
+        AddField::Metric => "metric",
+        AddField::View => "view",
+        AddField::Kind => "kind",
+        AddField::Display => "display",
+        AddField::Unit => "unit",
+    }
+}
+
+fn add_field_value_span(app: &App, field: AddField, value: &str) -> Span<'static> {
+    if app.add_field == field {
+        Span::styled(value.to_string(), selected_style(true))
+    } else {
+        Span::raw(value.to_string())
+    }
+}
+
+fn next_metric_view(view: MetricView, direction: isize) -> MetricView {
+    let views = [MetricView::Numeric, MetricView::Chart];
+    views[next_index(
+        views
+            .iter()
+            .position(|candidate| *candidate == view)
+            .unwrap_or(0),
+        views.len(),
+        direction,
+    )]
+}
+
+fn next_metric_kind_config(kind: MetricKindConfig, direction: isize) -> MetricKindConfig {
+    let kinds = [
+        MetricKindConfig::Auto,
+        MetricKindConfig::Counter,
+        MetricKindConfig::Gauge,
+        MetricKindConfig::Histogram,
+        MetricKindConfig::Timer,
+        MetricKindConfig::Distribution,
+        MetricKindConfig::Set,
+    ];
+    kinds[next_index(
+        kinds
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .unwrap_or(0),
+        kinds.len(),
+        direction,
+    )]
+}
+
+fn next_metric_display(display: MetricDisplay, direction: isize) -> MetricDisplay {
+    let displays = [
+        MetricDisplay::Default,
+        MetricDisplay::Latest,
+        MetricDisplay::Total,
+        MetricDisplay::Rate,
+    ];
+    displays[next_index(
+        displays
+            .iter()
+            .position(|candidate| *candidate == display)
+            .unwrap_or(0),
+        displays.len(),
+        direction,
+    )]
+}
+
+fn next_index(current: usize, len: usize, direction: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    if direction.is_negative() {
+        current.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (current + 1) % len
+    }
+}
+
+fn metric_kind_from_config(kind: MetricKindConfig) -> Option<MetricKind> {
+    match kind {
+        MetricKindConfig::Auto => None,
+        MetricKindConfig::Counter => Some(MetricKind::Counter),
+        MetricKindConfig::Gauge => Some(MetricKind::Gauge),
+        MetricKindConfig::Histogram => Some(MetricKind::Histogram),
+        MetricKindConfig::Timer => Some(MetricKind::Timer),
+        MetricKindConfig::Distribution => Some(MetricKind::Distribution),
+        MetricKindConfig::Set => Some(MetricKind::Set),
+    }
+}
+
+fn metric_kind_config_from_metric_kind(kind: &MetricKind) -> MetricKindConfig {
+    match kind {
+        MetricKind::Counter => MetricKindConfig::Counter,
+        MetricKind::Gauge => MetricKindConfig::Gauge,
+        MetricKind::Histogram => MetricKindConfig::Histogram,
+        MetricKind::Timer => MetricKindConfig::Timer,
+        MetricKind::Distribution => MetricKindConfig::Distribution,
+        MetricKind::Set => MetricKindConfig::Set,
+        MetricKind::Unknown(_) => MetricKindConfig::Auto,
+    }
+}
+
+fn effective_metric_kind_name(app: &App, metric: &MetricState) -> String {
+    if matches!(metric.kind, MetricKind::Unknown(_))
+        && app.configured_kind(&metric.name) != MetricKindConfig::Auto
+    {
+        metric_kind_config_name(app.configured_kind(&metric.name)).to_string()
+    } else {
+        metric.kind.to_string()
+    }
+}
+
+fn metric_kind_display(app: &App, metric: &MetricState) -> String {
+    let kind = effective_metric_kind_name(app, metric);
+    let display = app.display_mode(&metric.name);
+    if display == MetricDisplay::Default {
+        kind
+    } else {
+        format!("{kind}/{}", metric_display_name(display))
+    }
+}
+
+fn point_display_value(point: &Point, display: MetricDisplay) -> Option<f64> {
+    match display {
+        MetricDisplay::Default | MetricDisplay::Latest => Some(point.latest),
+        MetricDisplay::Total => Some(point.total),
+        MetricDisplay::Rate => point.rate_per_sec,
+    }
+}
+
+fn format_display_value(metric: &MetricState, display: MetricDisplay, unit: &str) -> String {
+    metric
+        .samples
+        .back()
+        .and_then(|point| point_display_value(point, display))
+        .map_or_else(|| "n/a".to_string(), |value| format_value(value, unit))
+}
+
+fn chart_axis_title(kind: &str, display: MetricDisplay, unit: &str) -> String {
+    let display = match display {
+        MetricDisplay::Default => "latest",
+        display => metric_display_name(display),
+    };
+    if unit.is_empty() {
+        format!("{kind} {display}")
+    } else if matches!(display, "rate") {
+        format!("{kind} {display} ({unit}/s)")
+    } else {
+        format!("{kind} {display} ({unit})")
+    }
+}
+
 fn series_key(name: &str, tags: &[(String, String)]) -> String {
     let mut key = name.to_string();
     for (tag_key, tag_value) in canonical_tags(tags) {
@@ -1332,16 +1805,16 @@ struct RetainedStats {
 
 fn retained_stats(metric: &MetricState) -> Option<RetainedStats> {
     let mut samples = metric.samples.iter();
-    let first = samples.next()?.value;
+    let first = samples.next()?.latest;
     let mut min = first;
     let mut max = first;
     let mut sum = first;
     let mut count = 1usize;
 
     for point in samples {
-        min = min.min(point.value);
-        max = max.max(point.value);
-        sum += point.value;
+        min = min.min(point.latest);
+        max = max.max(point.latest);
+        sum += point.latest;
         count += 1;
     }
 
@@ -1354,8 +1827,8 @@ fn retained_stats(metric: &MetricState) -> Option<RetainedStats> {
 
 fn retained_delta(metric: &MetricState) -> Option<f64> {
     let mut samples = metric.samples.iter().rev();
-    let latest = samples.next()?.value;
-    let previous = samples.next()?.value;
+    let latest = samples.next()?.latest;
+    let previous = samples.next()?.latest;
     Some(latest - previous)
 }
 
@@ -1384,6 +1857,10 @@ fn selected_style(focused: bool) -> Style {
     }
 }
 
+fn is_ctrl_x(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('x') && modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn sync_viewport(scroll: &mut usize, selected: &mut usize, page: usize, count: usize) {
     if count == 0 {
         *scroll = 0;
@@ -1407,6 +1884,10 @@ fn sorted_metrics(app: &App) -> Vec<&MetricState> {
     let mut metrics = app.metrics.values().collect::<Vec<_>>();
     metrics.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.labels.cmp(&b.labels)));
     metrics
+}
+
+fn metric_index_by_name(metrics: &[&MetricState], name: &str) -> Option<usize> {
+    metrics.iter().position(|metric| metric.name == name)
 }
 
 fn format_value(value: f64, unit: &str) -> String {
@@ -1443,6 +1924,7 @@ fn format_tags_full(tags: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -1467,7 +1949,7 @@ mod tests {
     #[test]
     fn labelled_samples_are_distinct_series() {
         let (_tx, rx) = mpsc::channel();
-        let mut app = App::new(Config::default(), rx);
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
         let now = Instant::now();
 
         app.metrics.insert(
@@ -1523,7 +2005,7 @@ mod tests {
     #[test]
     fn search_filters_metric_lists() {
         let (_tx, rx) = mpsc::channel();
-        let mut app = App::new(Config::default(), rx);
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
 
         app.metrics.insert(
             "requests|service=api".to_string(),
@@ -1547,11 +2029,13 @@ mod tests {
             metrics: vec![MetricConfig {
                 name: "tracked".to_string(),
                 view: MetricView::Numeric,
+                kind: MetricKindConfig::Auto,
+                display: MetricDisplay::Default,
                 unit: String::new(),
             }],
             ..Config::default()
         };
-        let mut app = App::new(config, rx);
+        let mut app = App::new(config, PathBuf::from("test.toml"), rx);
 
         tx.send(Sample {
             name: "untracked".to_string(),
@@ -1564,7 +2048,11 @@ mod tests {
         app.drain_samples();
 
         assert!(app.seen_metrics.contains_key("untracked"));
-        assert!(app.metrics.is_empty());
+        assert!(
+            app.metrics
+                .values()
+                .all(|metric| metric.name != "untracked")
+        );
     }
 
     #[test]
@@ -1574,11 +2062,13 @@ mod tests {
             metrics: vec![MetricConfig {
                 name: "tracked".to_string(),
                 view: MetricView::Numeric,
+                kind: MetricKindConfig::Auto,
+                display: MetricDisplay::Default,
                 unit: String::new(),
             }],
             ..Config::default()
         };
-        let mut app = App::new(config, rx);
+        let mut app = App::new(config, PathBuf::from("test.toml"), rx);
 
         app.seen_metrics.insert(
             "untracked".to_string(),
@@ -1586,6 +2076,8 @@ mod tests {
         );
         app.add_query = "untracked".to_string();
         app.add_view = MetricView::Chart;
+        app.add_kind = MetricKindConfig::Counter;
+        app.add_display = MetricDisplay::Rate;
         app.add_unit = "rows".to_string();
         app.hidden_metrics.insert("untracked".to_string());
 
@@ -1593,9 +2085,126 @@ mod tests {
 
         let added = app.metric_config.get("untracked").unwrap();
         assert_eq!(added.view, MetricView::Chart);
+        assert_eq!(added.kind, MetricKindConfig::Counter);
+        assert_eq!(added.display, MetricDisplay::Rate);
         assert_eq!(added.unit, "rows");
         assert!(app.should_track("untracked"));
         assert!(!app.hidden_metrics.contains("untracked"));
+        assert_eq!(app.focus, Focus::Charts);
+        assert_eq!(
+            app.selected_metric().map(|metric| metric.name.as_str()),
+            Some("untracked")
+        );
+    }
+
+    #[test]
+    fn add_selects_new_numeric_metric() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
+        app.add_query = "manual.numeric".to_string();
+        app.add_view = MetricView::Numeric;
+
+        app.add_selected_metric();
+
+        assert_eq!(app.focus, Focus::Numeric);
+        assert_eq!(
+            app.selected_metric().map(|metric| metric.name.as_str()),
+            Some("manual.numeric")
+        );
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_s_saves_config() {
+        let (_tx, rx) = mpsc::channel();
+        let path = temp_config_path("ctrl-x-ctrl-s");
+        let mut app = App::new(Config::default(), path.clone(), rx);
+        app.add_query = "manual.save".to_string();
+        app.add_selected_metric();
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("manual.save"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_c_quits() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
+
+        assert!(!app.handle_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn configured_metric_placeholder_uses_configured_kind() {
+        let (_tx, rx) = mpsc::channel();
+        let config = Config {
+            metrics: vec![MetricConfig {
+                name: "manual.counter".to_string(),
+                view: MetricView::Chart,
+                kind: MetricKindConfig::Counter,
+                display: MetricDisplay::Rate,
+                unit: "req".to_string(),
+            }],
+            ..Config::default()
+        };
+        let app = App::new(config, PathBuf::from("test.toml"), rx);
+
+        let metric = app.metrics.values().next().unwrap();
+        assert_eq!(metric.name, "manual.counter");
+        assert_eq!(metric.kind, MetricKind::Counter);
+        assert_eq!(app.display_mode("manual.counter"), MetricDisplay::Rate);
+    }
+
+    #[test]
+    fn add_pane_control_keys_cycle_kind_and_display() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
+        app.open_add();
+
+        app.handle_add_key(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        app.handle_add_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        app.handle_add_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.add_view, MetricView::Chart);
+        assert_eq!(app.add_kind, MetricKindConfig::Counter);
+        assert_eq!(app.add_display, MetricDisplay::Latest);
+    }
+
+    #[test]
+    fn counter_rate_display_uses_sample_delta_over_time() {
+        let mut metric = MetricState::new("requests".to_string(), String::new(), 8);
+        let start = Instant::now();
+
+        metric.push(
+            Sample {
+                name: "requests".to_string(),
+                value: 10.0,
+                kind: MetricKind::Counter,
+                tags: Vec::new(),
+                received_at: start,
+            },
+            8,
+        );
+        metric.push(
+            Sample {
+                name: "requests".to_string(),
+                value: 20.0,
+                kind: MetricKind::Counter,
+                tags: Vec::new(),
+                received_at: start + Duration::from_secs(4),
+            },
+            8,
+        );
+
+        assert_eq!(
+            point_display_value(metric.samples.back().unwrap(), MetricDisplay::Rate),
+            Some(5.0)
+        );
     }
 
     #[test]
@@ -1606,17 +2215,21 @@ mod tests {
                 MetricConfig {
                     name: "tracked".to_string(),
                     view: MetricView::Numeric,
+                    kind: MetricKindConfig::Auto,
+                    display: MetricDisplay::Default,
                     unit: String::new(),
                 },
                 MetricConfig {
                     name: "other".to_string(),
                     view: MetricView::Numeric,
+                    kind: MetricKindConfig::Auto,
+                    display: MetricDisplay::Default,
                     unit: String::new(),
                 },
             ],
             ..Config::default()
         };
-        let mut app = App::new(config, rx);
+        let mut app = App::new(config, PathBuf::from("test.toml"), rx);
 
         app.metrics.insert(
             series_key("tracked", &[("service".to_string(), "api".to_string())]),
@@ -1650,7 +2263,7 @@ mod tests {
     #[test]
     fn remove_metric_hides_auto_tracked_metric() {
         let (_tx, rx) = mpsc::channel();
-        let mut app = App::new(Config::default(), rx);
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
 
         app.metrics.insert(
             series_key("auto", &[]),
@@ -1664,5 +2277,84 @@ mod tests {
         assert!(!app.should_track("auto"));
         assert!(app.hidden_metrics.contains("auto"));
         assert!(app.metrics.is_empty());
+    }
+
+    #[test]
+    fn config_for_save_materializes_auto_tracked_metrics_without_hidden() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), PathBuf::from("test.toml"), rx);
+
+        app.metrics.insert(
+            series_key("auto", &[]),
+            MetricState::new("auto".to_string(), String::new(), 8),
+        );
+        app.metrics.insert(
+            series_key("removed", &[]),
+            MetricState::new("removed".to_string(), String::new(), 8),
+        );
+        app.hidden_metrics.insert("removed".to_string());
+
+        let saved = app.config_for_save();
+
+        assert_eq!(saved.metrics.len(), 1);
+        assert_eq!(saved.metrics[0].name, "auto");
+    }
+
+    #[test]
+    fn write_config_saves_runtime_metric_config() {
+        let (_tx, rx) = mpsc::channel();
+        let path = temp_config_path("write-config");
+        let config = Config {
+            listen: "127.0.0.1:18125".to_string(),
+            history_points: 80,
+            redraw_millis: 125,
+            metrics: vec![MetricConfig {
+                name: "original".to_string(),
+                view: MetricView::Numeric,
+                kind: MetricKindConfig::Auto,
+                display: MetricDisplay::Default,
+                unit: String::new(),
+            }],
+        };
+        let mut app = App::new(config, path.clone(), rx);
+
+        app.metric_config.insert(
+            "added".to_string(),
+            MetricConfig {
+                name: "added".to_string(),
+                view: MetricView::Chart,
+                kind: MetricKindConfig::Counter,
+                display: MetricDisplay::Rate,
+                unit: "rows".to_string(),
+            },
+        );
+        app.remove_metric("original");
+
+        app.write_config().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let saved: Config = toml::from_str(&contents).unwrap();
+        assert_eq!(saved.listen, "127.0.0.1:18125");
+        assert_eq!(saved.history_points, 80);
+        assert_eq!(saved.redraw_millis, 125);
+        assert_eq!(saved.metrics.len(), 1);
+        assert_eq!(saved.metrics[0].name, "added");
+        assert_eq!(saved.metrics[0].view, MetricView::Chart);
+        assert_eq!(saved.metrics[0].kind, MetricKindConfig::Counter);
+        assert_eq!(saved.metrics[0].display, MetricDisplay::Rate);
+        assert_eq!(saved.metrics[0].unit, "rows");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    fn temp_config_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "spinal-tap-{name}-{}-{nanos}.toml",
+            std::process::id()
+        ))
     }
 }

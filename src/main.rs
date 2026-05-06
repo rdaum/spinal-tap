@@ -24,11 +24,14 @@ use ingest::spawn_ingest;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let save_path = config_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("spinal-tap.toml"));
     let config = Config::load(config_path.as_deref())?;
 
     let (tx, rx) = mpsc::channel();
     let _ingest = spawn_ingest(config.listen.clone(), tx);
 
-    ui::run(config, rx)?;
+    ui::run(config, save_path, rx)?;
     Ok(())
 }

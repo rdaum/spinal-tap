@@ -6,6 +6,8 @@ redraw_millis = 250
 [[metrics]]
 name = "requests"
 view = "chart"
+kind = "counter"
+display = "rate"
 unit = "req"
 
 # Labelled DogStatsD series are grouped under the base metric name.
@@ -15,14 +17,20 @@ unit = "req"
 [[metrics]]
 name = "labelled.requests"
 view = "chart"
+kind = "counter"
+display = "rate"
 unit = "req"
 
 [[metrics]]
 name = "queue.depth"
 view = "numeric"
+kind = "gauge"
+display = "latest"
 unit = "jobs"
 
 [[metrics]]
 name = "request.duration"
 view = "chart"
+kind = "timer"
+display = "latest"
 unit = "ms"
