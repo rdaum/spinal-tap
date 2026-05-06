@@ -63,6 +63,8 @@ Both lines match `name = "requests"`, but render as separate labelled rows/chart
 - `c` with an active filter: clear the current filter.
 - In the add pane, Up/Down selects a discovered metric, Left/Right toggles numeric/chart, Tab edits
   units, Ctrl-W clears the active field, Enter adds, and Esc cancels.
+- In the details pane, `d` removes the selected base metric and all of its labelled series from the
+  live dashboard.
 - Esc or Enter: close the details pane.
 - `q` or Ctrl-C: quit.
 

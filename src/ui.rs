@@ -81,6 +81,7 @@ struct App {
     metrics: HashMap<String, MetricState>,
     seen_metrics: HashMap<String, SeenMetric>,
     metric_config: HashMap<String, MetricConfig>,
+    hidden_metrics: HashSet<String>,
     track_all: bool,
     received: u64,
     started_at: Instant,
@@ -119,6 +120,7 @@ impl App {
             metrics: HashMap::new(),
             seen_metrics: HashMap::new(),
             metric_config,
+            hidden_metrics: HashSet::new(),
             track_all,
             received: 0,
             started_at: Instant::now(),
@@ -168,7 +170,8 @@ impl App {
     }
 
     fn should_track(&self, name: &str) -> bool {
-        self.track_all || self.metric_config.contains_key(name)
+        (self.track_all || self.metric_config.contains_key(name))
+            && !self.hidden_metrics.contains(name)
     }
 
     fn configured_view(&self, name: &str) -> MetricView {
@@ -195,6 +198,15 @@ impl App {
         }
 
         if self.details_open {
+            if matches!(code, KeyCode::Char('d' | 'D'))
+                && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
+            {
+                if let Some(name) = self.selected_metric().map(|metric| metric.name.clone()) {
+                    self.remove_metric(&name);
+                }
+                return false;
+            }
+
             if matches!(code, KeyCode::Enter | KeyCode::Esc) {
                 self.details_open = false;
                 return false;
@@ -326,6 +338,7 @@ impl App {
             return;
         };
 
+        self.hidden_metrics.remove(&name);
         self.metric_config.insert(
             name.clone(),
             MetricConfig {
@@ -339,6 +352,14 @@ impl App {
         self.add_unit.clear();
         self.add_selected = 0;
         self.add_edit_unit = false;
+        self.sync_viewports();
+    }
+
+    fn remove_metric(&mut self, name: &str) {
+        self.metric_config.remove(name);
+        self.hidden_metrics.insert(name.to_string());
+        self.metrics.retain(|_, metric| metric.name != name);
+        self.details_open = false;
         self.sync_viewports();
     }
 
@@ -782,13 +803,13 @@ fn render_details(frame: &mut Frame, app: &App) {
             Span::raw(tags),
         ]),
         Line::from(vec![
+            Span::styled(" d ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" remove metric  "),
             Span::styled(
-                "Enter/Esc ",
+                " Enter/Esc ",
                 Style::default().fg(Color::Black).bg(Color::Gray),
             ),
-            Span::raw(" close  "),
-            Span::styled("future ", detail_label_style()),
-            Span::raw("actions can target this selected metric"),
+            Span::raw(" close"),
         ]),
     ];
 
@@ -1566,6 +1587,7 @@ mod tests {
         app.add_query = "untracked".to_string();
         app.add_view = MetricView::Chart;
         app.add_unit = "rows".to_string();
+        app.hidden_metrics.insert("untracked".to_string());
 
         app.add_selected_metric();
 
@@ -1573,5 +1595,74 @@ mod tests {
         assert_eq!(added.view, MetricView::Chart);
         assert_eq!(added.unit, "rows");
         assert!(app.should_track("untracked"));
+        assert!(!app.hidden_metrics.contains("untracked"));
+    }
+
+    #[test]
+    fn remove_metric_drops_config_and_all_labelled_series() {
+        let (_tx, rx) = mpsc::channel();
+        let config = Config {
+            metrics: vec![
+                MetricConfig {
+                    name: "tracked".to_string(),
+                    view: MetricView::Numeric,
+                    unit: String::new(),
+                },
+                MetricConfig {
+                    name: "other".to_string(),
+                    view: MetricView::Numeric,
+                    unit: String::new(),
+                },
+            ],
+            ..Config::default()
+        };
+        let mut app = App::new(config, rx);
+
+        app.metrics.insert(
+            series_key("tracked", &[("service".to_string(), "api".to_string())]),
+            MetricState::new("tracked".to_string(), "[service:api]".to_string(), 8),
+        );
+        app.metrics.insert(
+            series_key("tracked", &[("service".to_string(), "worker".to_string())]),
+            MetricState::new("tracked".to_string(), "[service:worker]".to_string(), 8),
+        );
+        app.metrics.insert(
+            series_key("other", &[]),
+            MetricState::new("other".to_string(), String::new(), 8),
+        );
+
+        app.remove_metric("tracked");
+
+        assert!(!app.metric_config.contains_key("tracked"));
+        assert!(app.hidden_metrics.contains("tracked"));
+        assert!(!app.should_track("tracked"));
+        assert!(app.should_track("other"));
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(
+            app.metrics
+                .values()
+                .next()
+                .map(|metric| metric.name.as_str()),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn remove_metric_hides_auto_tracked_metric() {
+        let (_tx, rx) = mpsc::channel();
+        let mut app = App::new(Config::default(), rx);
+
+        app.metrics.insert(
+            series_key("auto", &[]),
+            MetricState::new("auto".to_string(), String::new(), 8),
+        );
+
+        assert!(app.should_track("auto"));
+
+        app.remove_metric("auto");
+
+        assert!(!app.should_track("auto"));
+        assert!(app.hidden_metrics.contains("auto"));
+        assert!(app.metrics.is_empty());
     }
 }
