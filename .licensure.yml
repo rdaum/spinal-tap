@@ -28,6 +28,7 @@ comments:
 
 excludes:
   - \.git/.*
+  - \.github/.*
   - \.idea/.*
   - target/.*
   - Cargo.lock
