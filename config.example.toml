@@ -16,7 +16,7 @@ unit = "req"
 #   requests:1|c|#service:worker,host:b
 [[metrics]]
 name = "labelled.requests"
-view = "chart"
+view = "sparkline"
 kind = "counter"
 display = "rate"
 unit = "req"

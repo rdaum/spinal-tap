@@ -48,6 +48,7 @@ pub struct MetricConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum MetricView {
     Chart,
+    Sparkline,
     #[default]
     Numeric,
 }

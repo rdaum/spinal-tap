@@ -25,7 +25,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table,
+    Wrap,
 };
 
 use crate::config::{Config, MetricConfig, MetricDisplay, MetricKindConfig, MetricView};
@@ -34,6 +35,7 @@ use crate::dogstatsd::{MetricKind, Sample};
 const DEFAULT_CHART_HEIGHT: u16 = 9;
 const MIN_CHART_HEIGHT: u16 = 6;
 const MAX_CHART_HEIGHT: u16 = 24;
+const SPARKLINE_HEIGHT: u16 = 3;
 
 pub fn run(config: Config, config_path: PathBuf, rx: Receiver<Sample>) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -261,6 +263,13 @@ impl App {
         }
 
         if self.details_open {
+            if matches!(code, KeyCode::Char('v' | 'V'))
+                && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
+            {
+                self.cycle_selected_metric_view();
+                return false;
+            }
+
             if matches!(code, KeyCode::Char('d' | 'D'))
                 && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
             {
@@ -292,6 +301,7 @@ impl App {
                 self.search_query.clear();
                 self.sync_viewports();
             }
+            KeyCode::Char('v' | 'V') => self.cycle_selected_metric_view(),
             KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.toggle_focus(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selected(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selected(-1),
@@ -495,6 +505,43 @@ impl App {
         self.metrics.retain(|_, metric| metric.name != name);
         self.details_open = false;
         self.sync_viewports();
+    }
+
+    fn cycle_selected_metric_view(&mut self) {
+        let Some(metric) = self.selected_metric() else {
+            return;
+        };
+        let name = metric.name.clone();
+        let next_view = match self.configured_view(&name) {
+            MetricView::Chart => MetricView::Sparkline,
+            MetricView::Sparkline => MetricView::Numeric,
+            MetricView::Numeric => MetricView::Chart,
+        };
+
+        self.set_metric_view(&name, next_view);
+        self.select_metric_by_name(&name);
+    }
+
+    fn set_metric_view(&mut self, name: &str, view: MetricView) {
+        let kind = self
+            .metrics
+            .values()
+            .find(|metric| metric.name == name)
+            .map(|metric| metric_kind_config_from_metric_kind(&metric.kind))
+            .unwrap_or(MetricKindConfig::Auto);
+        let unit = self.unit(name).to_string();
+        let display = self.display_mode(name);
+
+        self.metric_config
+            .entry(name.to_string())
+            .and_modify(|config| config.view = view)
+            .or_insert_with(|| MetricConfig {
+                name: name.to_string(),
+                view,
+                kind,
+                display,
+                unit,
+            });
     }
 
     fn handle_ctrl_x_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -702,7 +749,10 @@ impl App {
     }
 
     fn chart_filter(&self, metric: &MetricState) -> bool {
-        self.configured_view(&metric.name) == MetricView::Chart && self.matches_search(metric)
+        matches!(
+            self.configured_view(&metric.name),
+            MetricView::Chart | MetricView::Sparkline
+        ) && self.matches_search(metric)
     }
 
     fn numeric_metrics(&self) -> Vec<&MetricState> {
@@ -745,7 +795,7 @@ impl App {
     fn select_metric_by_name(&mut self, name: &str) {
         self.focus = match self.configured_view(name) {
             MetricView::Numeric => Focus::Numeric,
-            MetricView::Chart => Focus::Charts,
+            MetricView::Chart | MetricView::Sparkline => Focus::Charts,
         };
 
         match self.focus {
@@ -926,6 +976,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" search  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" add  "),
+        Span::styled(" v ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" view  "),
         Span::styled(" C-x s ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" save  "),
         Span::styled(" +/- ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -1021,10 +1073,7 @@ fn render_details(frame: &mut Frame, app: &App) {
             Span::styled("kind ", detail_label_style()),
             Span::raw(effective_metric_kind_name(app, metric)),
             Span::styled("  view ", detail_label_style()),
-            Span::raw(match view {
-                MetricView::Chart => "chart",
-                MetricView::Numeric => "numeric",
-            }),
+            Span::raw(metric_view_name(view)),
             Span::styled("  display ", detail_label_style()),
             Span::raw(metric_display_name(display)),
             Span::styled("  unit ", detail_label_style()),
@@ -1070,6 +1119,8 @@ fn render_details(frame: &mut Frame, app: &App) {
             Span::raw(tags),
         ]),
         Line::from(vec![
+            Span::styled(" v ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" cycle view  "),
             Span::styled(" d ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" remove metric  "),
             Span::styled(
@@ -1225,7 +1276,7 @@ fn render_add(frame: &mut Frame, app: &App) {
             " Ctrl-V ",
             Style::default().fg(Color::Black).bg(Color::Gray),
         ),
-        Span::raw(" view  "),
+        Span::raw(" view mode  "),
         Span::styled(
             " Ctrl-K ",
             Style::default().fg(Color::Black).bg(Color::Gray),
@@ -1349,8 +1400,10 @@ fn render_numeric(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
-    let visible_count = usize::from(area.height / app.chart_height).max(1);
-    app.chart_page = visible_count;
+    app.chart_page = {
+        let charted = app.chart_metrics();
+        visible_chart_count(app, &charted, app.chart_scroll, area.height)
+    };
     app.sync_viewports();
 
     let charted = app.chart_metrics();
@@ -1371,14 +1424,28 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let start = app.chart_scroll.min(charted.len().saturating_sub(1));
-    let end = (start + visible_count).min(charted.len());
-    let visible_charted = &charted[start..end];
+    let end = chart_visible_end(app, &charted, start, area.height);
 
-    for (index, metric) in visible_charted.iter().copied().enumerate() {
-        let Some(area) = chart_area_at(area, index, app.chart_height) else {
+    let mut y = area.y;
+    for (index, metric) in charted
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        if y >= area.y.saturating_add(area.height) {
             break;
+        }
+
+        let height = chart_item_height(app, metric).min(area.y + area.height - y);
+        let chart_area = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height,
         };
-        let pane_title = if index == 0 {
+        let pane_title = if index == start {
             Some(pane_title(
                 "Charts",
                 app.focus == Focus::Charts,
@@ -1390,10 +1457,10 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             None
         };
-        let selected = start + index == app.chart_selected;
-        render_chart(ChartRender {
+        let selected = index == app.chart_selected;
+        let render = ChartRender {
             frame,
-            area,
+            area: chart_area,
             metric,
             unit: app.unit(&metric.name),
             display: app.display_mode(&metric.name),
@@ -1402,22 +1469,45 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &mut App) {
             pane_title,
             selected,
             focused: app.focus == Focus::Charts,
-        });
+        };
+
+        match app.configured_view(&metric.name) {
+            MetricView::Sparkline => render_sparkline(render),
+            MetricView::Chart | MetricView::Numeric => render_chart(render),
+        }
+
+        y = y.saturating_add(height);
     }
 }
 
-fn chart_area_at(area: Rect, index: usize, chart_height: u16) -> Option<Rect> {
-    let offset = u16::try_from(index).ok()?.checked_mul(chart_height)?;
-    if offset >= area.height {
-        return None;
-    }
+fn visible_chart_count(app: &App, metrics: &[&MetricState], start: usize, height: u16) -> usize {
+    chart_visible_end(app, metrics, start, height)
+        .saturating_sub(start)
+        .max(1)
+}
 
-    Some(Rect {
-        x: area.x,
-        y: area.y + offset,
-        width: area.width,
-        height: chart_height.min(area.height - offset),
-    })
+fn chart_visible_end(app: &App, metrics: &[&MetricState], start: usize, height: u16) -> usize {
+    let mut used = 0u16;
+    let mut end = start;
+    for metric in metrics.iter().skip(start) {
+        let item_height = chart_item_height(app, metric);
+        if end > start && used.saturating_add(item_height) > height {
+            break;
+        }
+        used = used.saturating_add(item_height);
+        end += 1;
+        if used >= height {
+            break;
+        }
+    }
+    end.min(metrics.len())
+}
+
+fn chart_item_height(app: &App, metric: &MetricState) -> u16 {
+    match app.configured_view(&metric.name) {
+        MetricView::Sparkline => SPARKLINE_HEIGHT,
+        MetricView::Chart | MetricView::Numeric => app.chart_height,
+    }
 }
 
 struct ChartRender<'a, 'b> {
@@ -1518,6 +1608,74 @@ fn render_chart(args: ChartRender<'_, '_>) {
     frame.render_widget(chart, area);
 }
 
+fn render_sparkline(args: ChartRender<'_, '_>) {
+    let ChartRender {
+        frame,
+        area,
+        metric,
+        unit,
+        display,
+        pane_title,
+        selected,
+        focused,
+        ..
+    } = args;
+
+    let values = sparkline_values(metric, display);
+    let title = match pane_title {
+        Some(pane_title) => format!(
+            "{pane_title}  {}  {}",
+            metric_chart_title(metric),
+            format_display_value(metric, display, unit)
+        ),
+        None => format!(
+            " {}  {} ",
+            metric_chart_title(metric),
+            format_display_value(metric, display, unit)
+        ),
+    };
+
+    let sparkline = Sparkline::default()
+        .block(Block::bordered().title(title).border_style(if selected {
+            selected_style(focused)
+        } else {
+            Style::default()
+        }))
+        .style(if selected { Color::Yellow } else { Color::Cyan })
+        .max(100)
+        .data(values);
+
+    frame.render_widget(sparkline, area);
+}
+
+fn sparkline_values(metric: &MetricState, display: MetricDisplay) -> Vec<Option<u64>> {
+    let raw = metric
+        .samples
+        .iter()
+        .map(|point| point_display_value(point, display))
+        .collect::<Vec<_>>();
+    let values = raw.iter().flatten().copied().collect::<Vec<_>>();
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+
+    raw.into_iter()
+        .map(|value| {
+            value.map(|value| {
+                if range <= f64::EPSILON {
+                    100
+                } else {
+                    (((value - min) / range) * 99.0).round() as u64 + 1
+                }
+            })
+        })
+        .collect()
+}
+
 fn pane_title(
     label: &str,
     focused: bool,
@@ -1580,6 +1738,7 @@ fn seen_metric_matches_query(metric: &SeenMetric, query: &str) -> bool {
 fn metric_view_name(view: MetricView) -> &'static str {
     match view {
         MetricView::Chart => "chart",
+        MetricView::Sparkline => "sparkline",
         MetricView::Numeric => "numeric",
     }
 }
@@ -1624,7 +1783,11 @@ fn add_field_value_span(app: &App, field: AddField, value: &str) -> Span<'static
 }
 
 fn next_metric_view(view: MetricView, direction: isize) -> MetricView {
-    let views = [MetricView::Numeric, MetricView::Chart];
+    let views = [
+        MetricView::Numeric,
+        MetricView::Chart,
+        MetricView::Sparkline,
+    ];
     views[next_index(
         views
             .iter()
@@ -2167,12 +2330,64 @@ mod tests {
         app.open_add();
 
         app.handle_add_key(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(app.add_view, MetricView::Chart);
+        app.handle_add_key(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(app.add_view, MetricView::Sparkline);
         app.handle_add_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
         app.handle_add_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
-        assert_eq!(app.add_view, MetricView::Chart);
         assert_eq!(app.add_kind, MetricKindConfig::Counter);
         assert_eq!(app.add_display, MetricDisplay::Latest);
+    }
+
+    #[test]
+    fn v_cycles_selected_metric_view() {
+        let (_tx, rx) = mpsc::channel();
+        let config = Config {
+            metrics: vec![MetricConfig {
+                name: "requests".to_string(),
+                view: MetricView::Numeric,
+                kind: MetricKindConfig::Counter,
+                display: MetricDisplay::Rate,
+                unit: "req".to_string(),
+            }],
+            ..Config::default()
+        };
+        let mut app = App::new(config, PathBuf::from("test.toml"), rx);
+        app.handle_key(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.configured_view("requests"), MetricView::Chart);
+        assert_eq!(app.focus, Focus::Charts);
+
+        app.handle_key(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.configured_view("requests"), MetricView::Sparkline);
+        assert_eq!(app.focus, Focus::Charts);
+
+        app.handle_key(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.configured_view("requests"), MetricView::Numeric);
+        assert_eq!(app.focus, Focus::Numeric);
+    }
+
+    #[test]
+    fn sparkline_values_are_normalized() {
+        let mut metric = MetricState::new("requests".to_string(), String::new(), 8);
+        let start = Instant::now();
+        for (index, value) in [10.0, 20.0, 30.0].into_iter().enumerate() {
+            metric.push(
+                Sample {
+                    name: "requests".to_string(),
+                    value,
+                    kind: MetricKind::Gauge,
+                    tags: Vec::new(),
+                    received_at: start + Duration::from_secs(index as u64),
+                },
+                8,
+            );
+        }
+
+        assert_eq!(
+            sparkline_values(&metric, MetricDisplay::Latest),
+            vec![Some(1), Some(51), Some(100)]
+        );
     }
 
     #[test]

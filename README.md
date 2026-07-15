@@ -44,6 +44,9 @@ display = "latest"
 unit = "jobs"
 ```
 
+`view` can be `numeric`, `chart`, or `sparkline`. Charts and sparklines share the chart pane;
+sparklines are compact rows for scanning more series at once.
+
 Metric config matches the base metric name. Labelled DogStatsD series are split into distinct series
 and grouped together in the UI:
 
@@ -67,17 +70,18 @@ use `rate` for counters, or `latest`/`total` when you want that value plotted or
 - `/`: filter metrics by name or labels.
 - `a`: add a metric from discovered traffic or a typed base metric name.
 - Ctrl-X then Ctrl-S, or Ctrl-X then `s`: save the current runtime metric config.
-- `+`/`-`: increase/decrease chart height.
+- `v`: cycle the selected metric through numeric, chart, and sparkline views.
+- `+`/`-`: increase/decrease full chart height.
 - Enter: open the selected metric details pane.
 - Enter while searching: keep the current filter.
 - Esc while searching: stop editing and keep the current filter.
 - Ctrl-W while searching: clear the filter input.
 - `c` with an active filter: clear the current filter.
 - In the add pane, Up/Down selects a discovered metric, Tab moves between fields, Left/Right changes
-  view/kind/display, Ctrl-V cycles numeric/chart, Ctrl-K cycles kind, Ctrl-D cycles display, Ctrl-W
-  clears text fields, Enter adds, and Esc cancels.
-- In the details pane, `d` removes the selected base metric and all of its labelled series from the
-  live dashboard.
+  view/kind/display, Ctrl-V cycles numeric/chart/sparkline, Ctrl-K cycles kind, Ctrl-D cycles
+  display, Ctrl-W clears text fields, Enter adds, and Esc cancels.
+- In the details pane, `v` cycles the metric view and `d` removes the selected base metric and all of
+  its labelled series from the live dashboard.
 - Esc or Enter: close the details pane.
 - `q`, Ctrl-C, or Ctrl-X then Ctrl-C: quit.
 
